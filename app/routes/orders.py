@@ -14,66 +14,78 @@ def create_order(
     current_user: User = Depends(check_role([UserRole.BUYER, UserRole.ADMIN_SELLER])),
     db: Session = Depends(get_db)
 ):
-    if not current_user.buyer_profile:
-        # Auto-create buyer profile for admin/seller if missing
-        from ..models import BuyerProfile
-        new_profile = BuyerProfile(user_id=current_user.id, business_name=current_user.full_name)
-        db.add(new_profile)
+    try:
+        buyer_profile = current_user.buyer_profile
+        if not buyer_profile:
+            # Auto-create buyer profile for admin/seller if missing
+            from ..models import BuyerProfile
+            buyer_profile = BuyerProfile(user_id=current_user.id, business_name=current_user.full_name)
+            db.add(buyer_profile)
+            db.commit()
+            db.refresh(buyer_profile)
+        
+        if order_in.shipping_address:
+            buyer_profile.shipping_address = order_in.shipping_address
+            db.commit()
+
+        buyer_id = buyer_profile.id
+        total_amount = 0
+        items_to_create = []
+        
+        for item in order_in.items:
+            product = db.query(Product).filter(Product.id == item.product_id).first()
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+            
+            # Use bulk price if quantity meets minimum
+            min_qty = product.min_bulk_quantity or 10
+            bulk_price = product.bulk_price or product.price
+            price = bulk_price if item.quantity >= min_qty else product.price
+            
+            total_amount += price * item.quantity
+            
+            items_to_create.append(OrderItem(
+                product_id=product.id,
+                quantity=item.quantity,
+                price_at_purchase=price
+            ))
+            
+            # Deduct stock
+            if product.stock_quantity is None:
+                product.stock_quantity = 0
+            if product.stock_quantity < item.quantity:
+                raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
+            product.stock_quantity -= item.quantity
+
+        new_order = Order(
+            buyer_id=buyer_id,
+            total_amount=total_amount,
+            status=OrderStatus.PENDING
+        )
+        db.add(new_order)
         db.commit()
-        db.refresh(current_user)
-    
-    if order_in.shipping_address:
-        current_user.buyer_profile.shipping_address = order_in.shipping_address
+        db.refresh(new_order)
+        
+        for item in items_to_create:
+            item.order_id = new_order.id
+            db.add(item)
+        
+        db.commit()
+        db.refresh(new_order)
+        # Create delivery record
+        new_delivery = Delivery(
+            order_id=new_order.id,
+            status="pending"
+        )
+        db.add(new_delivery)
         db.commit()
 
-    buyer_id = current_user.buyer_profile.id
-    total_amount = 0
-    items_to_create = []
-    
-    for item in order_in.items:
-        product = db.query(Product).filter(Product.id == item.product_id).first()
-        if not product:
-            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
-        
-        # Use bulk price if quantity meets minimum
-        price = product.bulk_price if item.quantity >= product.min_bulk_quantity else product.price
-        total_amount += price * item.quantity
-        
-        items_to_create.append(OrderItem(
-            product_id=product.id,
-            quantity=item.quantity,
-            price_at_purchase=price
-        ))
-        
-        # Deduct stock
-        if product.stock_quantity < item.quantity:
-            raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
-        product.stock_quantity -= item.quantity
-
-    new_order = Order(
-        buyer_id=buyer_id,
-        total_amount=total_amount,
-        status=OrderStatus.PENDING
-    )
-    db.add(new_order)
-    db.commit()
-    db.refresh(new_order)
-    
-    for item in items_to_create:
-        item.order_id = new_order.id
-        db.add(item)
-    
-    db.commit()
-    db.refresh(new_order)
-    # Create delivery record
-    new_delivery = Delivery(
-        order_id=new_order.id,
-        status="pending"
-    )
-    db.add(new_delivery)
-    db.commit()
-
-    return new_order
+        return new_order
+    except Exception as e:
+        import traceback
+        with open("order_error.log", "w") as f:
+            f.write(traceback.format_exc())
+        raise
 
 @router.get("/my-orders", response_model=List[OrderResponse])
 def get_my_orders(
